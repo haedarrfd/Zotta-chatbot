@@ -1,12 +1,10 @@
-import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain_text_splitters import CharacterTextSplitter
-from langchain_openai import OpenAI, OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
-from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 import firebase_admin
 from firebase_admin import credentials, auth, firestore, exceptions
 import time
@@ -23,24 +21,21 @@ load_dotenv()
 # Page Title
 st.set_page_config(page_title="Zotta Chatbot with Document", page_icon="🤖", layout='centered')
 
-# Initialize Firebase app
+# Initialize Firebase 
 if not firebase_admin._apps:
   cred = credentials.Certificate("key.json")
   firebase_admin.initialize_app(cred)
 
-# Firestore instance
 db = firestore.client()
 
 # Sign in with google initialize
 CLIENT_ID = st.secrets['CLIENT_ID']
 CLIENT_SECRET = st.secrets['CLIENT_SECRET']
-REDIRECT_URI = 'http://localhost:8501/'
+REDIRECT_URI = st.secrets['REDIRECT_URI']
 
-# Created_at
+# created_at
 created_at = time.time()
-# convert to datetime
 date_time = datetime.fromtimestamp(created_at)
-# convert Created_at to string
 str_date_time = date_time.strftime("%d-%m-%Y, %H:%M:%S")
 
 # Sticky Sidebar
@@ -77,99 +72,51 @@ def render_image(filepath: str):
   image_string = f'data:image/png;base64,{content_encode}'
   return image_string
 
-# Zotta image
-zottaImg = render_image('./src/zotta.png')
+zottaImg = render_image('./resource/zotta.png')
 
-# Handle upload file
-def sidebar():
-  with st.sidebar:
-    # User profile
-    user = auth.get_user_by_email(global_state.email)
-    get_user_by_uid = db.collection('users').document(user.uid).get()
-
-    if get_user_by_uid.exists:
-      username = get_user_by_uid.to_dict().get('username')
-      st.markdown(f'''<p style="font-size: 18px; font-weight: 500; margin-bottom: 30px;">Welcome, {username}</p>''', unsafe_allow_html=True)
-    
-    # Upload file/document
-    file_uploader = st.file_uploader('Upload your document', help='PDF or CSV only', type=['pdf', 'csv'])
-
-    # Check if file isn't uploaded
-    if file_uploader is None:
-      st.warning('Please upload a file before continue!')
-
-    # Sign out button
-    if st.button('Sign Out', type='primary', key='sign_out'):
-      global_state.email = ''
-      st.rerun()
-
-    for _space in range(4):
-      st.write("\n")
-
-    # Footer
-    st.markdown('<p style="text-align: center; font-size: 13px; font-weight: 400; opacity: 0.8; margin-top: auto;">Zotta may provide inaccurate information, Consider checking important information.</p>', unsafe_allow_html=True)
-
-    return file_uploader
-
-# Handle process file pdf
-def handleFilePDF(file):
-  # Read the file/document PDF
+# Read the file and extract the content
+def handleFileContext(file):
   file_reader = PdfReader(file)
-
-  # Extract all text of the file into raw_text 
   raw_text = ''
   for content in file_reader.pages:
     raw_text += content.extract_text()
 
-  # Split it into chunks
-  text_split = CharacterTextSplitter(
+  # Split into chunks
+  text_splitter = CharacterTextSplitter(
     separator="\n", 
     chunk_size=1000, 
     chunk_overlap=200, 
     length_function=len
   )
-  chunks = text_split.split_text(raw_text)
+  chunks = text_splitter.split_text(raw_text)
   
-  # Embeddings instance
+  # Generate embeddings for each chunk
   embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-  # Convert it into embeddings using FAISS
-  create_embeddings = FAISS.from_texts(chunks, embeddings)
+  vector = FAISS.from_texts(chunks, embeddings)
+  return vector
 
-  return create_embeddings
-
-# Handle process file csv
-def handleFileCSV(llm, file):
-  # Read the file/document CSV
-  df = pd.read_csv(file)
-
-  # Construct pandas agent
-  agent = create_pandas_dataframe_agent(llm, df, verbose=True)
-
-  return agent
-
-# Add data user to firestore
+# Add data user to database firebase firestore
 def dataUser(email: str, username: str, created_at: str):
-  # If user already exists in the collection firestore don't add new user
+  # Check if user already is exist
   docs = db.collection('users').where('email', '==', email).stream()
-  isUserExists = any(doc.exists for doc in docs)
+  isUserExist = any(doc.exists for doc in docs)
 
   try:
     user = auth.get_user_by_email(email)
-    user_id = user.uid
 
-    if not isUserExists:
-      db.collection('users').document(document_id=user_id).set({
+    if not isUserExist:
+      db.collection('users').document(document_id=user.uid).set({
         'email': str(email),
         'username': str(username),
         'created_at': str(created_at)
       })
-  except exceptions.FirebaseError as e: 
+      
+  except exceptions.FirebaseError as err: 
     user = auth.create_user(email=email)
     get_user = auth.get_user_by_email(email)
-    user_id = get_user.uid
 
-    if not isUserExists:
-      db.collection('users').document(document_id=user_id).set({
+    if not isUserExist:
+      db.collection('users').document(document_id=get_user.uid).set({
         'email': str(email),
         'username': str(username),
         'created_at': str(created_at)
@@ -179,81 +126,60 @@ def dataUser(email: str, username: str, created_at: str):
 
 def home():
   try:
-    # Header
-    st.markdown(f'''<div style="text-align: center; display: flex; justify-content: center; align-items: center; margin-top: -50px; margin-bottom: 20px;"><img src="{zottaImg}" alt="Logo app" style="width: 100px; height: 100px; "/></div>''', unsafe_allow_html=True)
+    user = auth.get_user_by_email(global_state.email)
 
+
+    model_language = ChatOpenAI(temperature=0, model="gpt-4o")
+
+    with st.sidebar:
+      get_user_by_uid = db.collection('users').document(user.uid).get()
+      if get_user_by_uid.exists:
+        username = get_user_by_uid.to_dict().get('username')
+        st.markdown(f'''<p style="font-size: 18px; font-weight: 500; margin-bottom: 30px;">Welcome, {username}</p>''', unsafe_allow_html=True)
+      
+      upload_file = st.file_uploader('Upload your file', help='PDF', type=['pdf'])
+      if upload_file is None:
+        st.warning('Please upload a file before continue!')
+
+      # Sign out button
+      if st.button('Sign Out', type='primary', key='sign_out'):
+        global_state.email = ''
+        st.rerun()
+
+    # Header
+    st.markdown(f'''<div style="text-align: center; display: flex; justify-content: center; align-items: center; margin-top: -50px; margin-bottom: 20px;"><img src="{zottaImg}" alt="Logo app" style="width: 100px; height: 100px;" draggable="false"/></div>''', unsafe_allow_html=True)
     st.markdown('<p style="text-align: center; font-size: 32px; font-weight: 600;">Zotta</p>', unsafe_allow_html=True)
 
-    # Container content
     container = st.container(border=True)
 
-    # OpenAI instance
-    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0125")
-
-    # Instance upload file
-    upload_file = sidebar()
-
-    if upload_file is not None:
-      # Handle PDF file
-      if upload_file.type == 'application/pdf':
-        data_pdf = handleFilePDF(upload_file)
-
-      # Handle CSV file
-      elif upload_file.type == 'text/csv':
-        data_csv = handleFileCSV(llm, upload_file)        
-
-    # User prompt
     prompt = st.chat_input('Send a message to Zotta')
 
-    with st.spinner('Loading...'):
-      if prompt != '' and prompt is not None:
-        user = auth.get_user_by_email(global_state.email)
+    if upload_file is None and prompt is not None:
+      st.error('You have to upload a file before continue!')
 
-        # Handle prompt based on PDF file 
-        if upload_file.type == 'application/pdf':
-          # Similarity search
-          docs = data_pdf.similarity_search(prompt)
+    # Process extract content from a pdf file
+    if upload_file is not None:
+      data_content = handleFileContext(upload_file)
 
-          # Process Question answering
-          chain = load_qa_chain(llm, chain_type='stuff')
-          response_pdf = chain.run(input_documents=docs, question=prompt)
+      with st.spinner('Loading...'):
+        if prompt != '' and prompt is not None:
+          docs = data_content.similarity_search(prompt)
+          chain = load_qa_chain(model_language, chain_type='stuff')
+          response = chain({"input_documents": docs, "question": prompt}, return_only_outputs=True)
 
-          # Store the result to chat histories collection
           db.collection('chat_histories').document().set({
             'user_id': str(user.uid),
             'document_type': str(upload_file.type),
             'user_message': str(prompt),
-            'bot_response': str(response_pdf),
+            'bot_response': str(response['output_text']),
             'created_at': str(str_date_time)
           })
 
-          # Output message
           container.chat_message('human').write(prompt)
-          container.chat_message('assistant').write(f"Zotta : {response_pdf}")
-
-        # Handle prompt based on CSV file 
-        elif upload_file.type == 'text/csv':
-          # Agent process to thinking
-          response_csv = data_csv.run(prompt)
-
-          # Store the result to chat histories collection
-          db.collection('chat_histories').document().set({
-            'user_id': str(user.uid),
-            'document_type': str(upload_file.type),
-            'user_message': str(prompt),
-            'bot_response': str(response_csv),
-            'created_at': str(str_date_time)
-          })
-
-          # Output message
-          container.chat_message('human').write(prompt)
-          container.chat_message('assistant').write(f"Zotta : {response_csv}")
-
-        else:
-          st.error('Something wrong, try again!')
+          container.chat_message('assistant').write(f"Zotta : {response['output_text']}")
           
   except Exception as err:
-    st.error(f"Something wrong, Please be sure upload a file or the file format!")
+    st.error(f"Something wrong, Please be sure upload a file or the file format! {err}")
 
 # Sign In page
 def signInPage(url = ''):
@@ -286,7 +212,7 @@ def signInPage(url = ''):
       .btn-primary:hover {{
         background-color: #b3b9ff;
         color: #111827;
-      }}                   
+      }}           
       .google_icon {{
         width: 20px;
         height: auto;
@@ -310,6 +236,7 @@ def signInPage(url = ''):
       </div>
 """, height=200)
 
+# Handle user authentication and redirection
 def main(global_state, inner_call=False):
   client: GoogleOAuth2 = GoogleOAuth2(CLIENT_ID, CLIENT_SECRET)
   authorization_url = asyncio.run(
@@ -318,24 +245,22 @@ def main(global_state, inner_call=False):
   if not global_state.email:
     signInPage(authorization_url)
     try:
-      # Getting token from params
+      # Get token from params
       token_from_params = get_token_from_params(client=client, redirect_uri=REDIRECT_URI)
     except Exception as err:
       return None
     
-    # Decoding user using jwt
+    # Decoding user token
     user_info = decode_user(token=token_from_params['id_token'])
     global_state.email = user_info['email']
-    username = user_info['name']
-    # Store the user to users collection
-    dataUser(global_state.email, username, str_date_time)
+    # Store the user to firebase collection
+    dataUser(global_state.email, user_info['name'], str_date_time)
     st.rerun()
 
   if inner_call:
     user_email = global_state.email
     if not user_email:
       signInPage(authorization_url)
-      
     if user_email:
       home()
 
